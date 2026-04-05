@@ -1,0 +1,155 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from transformers import BertTokenizer, BertForSequenceClassification
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+import joblib
+from typing import Dict, List, Tuple
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class HybridFakeNewsDetector:
+    """Advanced hybrid model combining deep learning and traditional ML"""
+    
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.bert_model = None
+        self.lstm_model = None
+        self.traditional_models = {}
+        self.tokenizer = None
+        self.tfidf_vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 3))
+        self.ensemble_weights = [0.4, 0.3, 0.2, 0.1]  # BERT, LSTM, RF, GB
+        
+    def load_models(self):
+        """Load all pre-trained models"""
+        try:
+            # Load BERT model
+            self.bert_model = BertForSequenceClassification.from_pretrained(
+                'bert-base-uncased', num_labels=2
+            ).to(self.device)
+            self.bert_model.load_state_dict(torch.load('models/model_weights/bert_model.pkl'))
+            self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+            
+            # Load LSTM model
+            self.lstm_model = self._build_lstm_model()
+            self.lstm_model.load_state_dict(torch.load('models/model_weights/lstm_model.h5'))
+            
+            # Load traditional models
+            self.traditional_models['rf'] = joblib.load('models/model_weights/random_forest.pkl')
+            self.traditional_models['gb'] = joblib.load('models/model_weights/gradient_boost.pkl')
+            
+            logger.info("All models loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            return False
+    
+    def _build_lstm_model(self):
+        """Build LSTM architecture"""
+        class LSTMModel(nn.Module):
+            def __init__(self, vocab_size=5000, embedding_dim=100, hidden_dim=128, num_layers=2):
+                super(LSTMModel, self).__init__()
+                self.embedding = nn.Embedding(vocab_size, embedding_dim)
+                self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
+                                   batch_first=True, dropout=0.5)
+                self.dropout = nn.Dropout(0.5)
+                self.fc = nn.Linear(hidden_dim, 2)
+                
+            def forward(self, x):
+                embedded = self.embedding(x)
+                lstm_out, (hidden, cell) = self.lstm(embedded)
+                hidden = self.dropout(hidden[-1])
+                output = self.fc(hidden)
+                return output
+        
+        return LSTMModel()
+    
+    def predict_bert(self, text: str) -> float:
+        """BERT-based prediction"""
+        inputs = self.tokenizer(text, return_tensors="pt", 
+                               truncation=True, padding=True, max_length=512)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.bert_model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=1)
+        
+        return probs[0][1].item()  # Probability of being fake
+    
+    def predict_lstm(self, text: str) -> float:
+        """LSTM-based prediction"""
+        # Simplified - in production, use proper tokenization
+        tokens = self._text_to_sequence(text)
+        tensor_input = torch.tensor(tokens).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            output = self.lstm_model(tensor_input)
+            probs = torch.softmax(output, dim=1)
+        
+        return probs[0][1].item()
+    
+    def predict_traditional(self, text: str) -> Dict:
+        """Traditional ML predictions"""
+        features = self.tfidf_vectorizer.transform([text])
+        
+        predictions = {}
+        for name, model in self.traditional_models.items():
+            prob = model.predict_proba(features)[0][1]
+            predictions[name] = prob
+        
+        return predictions
+    
+    def predict_hybrid(self, text: str) -> Dict:
+        """Ensemble prediction combining all models"""
+        # Get individual predictions
+        bert_score = self.predict_bert(text)
+        lstm_score = self.predict_lstm(text)
+        traditional_scores = self.predict_traditional(text)
+        
+        # Weighted ensemble
+        final_score = (
+            self.ensemble_weights[0] * bert_score +
+            self.ensemble_weights[1] * lstm_score +
+            self.ensemble_weights[2] * traditional_scores['rf'] +
+            self.ensemble_weights[3] * traditional_scores['gb']
+        )
+        
+        # Confidence calculation
+        predictions_variance = np.var([
+            bert_score, lstm_score, 
+            traditional_scores['rf'], traditional_scores['gb']
+        ])
+        confidence = 1 - min(predictions_variance, 0.5)
+        
+        return {
+            'final_score': final_score,
+            'is_fake': final_score > 0.5,
+            'confidence': confidence,
+            'individual_scores': {
+                'bert': bert_score,
+                'lstm': lstm_score,
+                'random_forest': traditional_scores['rf'],
+                'gradient_boost': traditional_scores['gb']
+            },
+            'verdict': 'FAKE NEWS' if final_score > 0.5 else 'REAL NEWS',
+            'risk_level': self._calculate_risk_level(final_score)
+        }
+    
+    def _calculate_risk_level(self, score: float) -> str:
+        """Calculate risk level based on probability"""
+        if score > 0.8:
+            return "High Risk - Likely Fake"
+        elif score > 0.6:
+            return "Medium Risk - Suspicious"
+        elif score > 0.4:
+            return "Low Risk - Questionable"
+        else:
+            return "Very Low Risk - Likely Real"
+    
+    def _text_to_sequence(self, text: str) -> List[int]:
+        """Convert text to sequence of integers (simplified)"""
+        # In production, use proper tokenizer
+        return [hash(word) % 5000 for word in text.split()[:100]]
